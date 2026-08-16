@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.edgeos-vms/
+build/
+dist/
+*.img
+*.iso
+*.qcow2
+*.raw
+*.log
