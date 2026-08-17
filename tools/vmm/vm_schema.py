@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-CURRENT_CONFIG_VERSION = 6
+CURRENT_CONFIG_VERSION = 7
 MAX_BUILD_JOBS = 256
 SUPPORTED_DISPLAY_RESOLUTIONS = (
     "640x480",
@@ -26,13 +26,19 @@ SUPPORTED_DISPLAY_RESOLUTIONS = (
     "1600x900",
     "1920x1080",
     "2560x1440",
+    "3440x1440",
     "3840x2160",
+    "5120x2160",
+    "5120x2880",
+    "7680x4320",
 )
 MIN_DISPLAY_WIDTH = 320
 MIN_DISPLAY_HEIGHT = 200
 MAX_DISPLAY_WIDTH = 7680
 MAX_DISPLAY_HEIGHT = 4320
 MAX_DISPLAY_FRAMEBUFFER_BYTES = 128 * 1024 * 1024
+MIN_DISPLAY_REFRESH_HZ = 1
+MAX_DISPLAY_REFRESH_HZ = 10000
 DISPLAY_RESOLUTION_RE = re.compile(r"^(\d{2,5})[xX×](\d{2,5})$")
 
 
@@ -100,6 +106,11 @@ def migrate_config(raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         config.setdefault("build_jobs", 0)
         config["config_version"] = 6
         version = 6
+        changed = True
+    if version == 6:
+        config.setdefault("display_refresh_hz", 60)
+        config["config_version"] = 7
+        version = 7
         changed = True
     validate_config(config)
     return config, changed
@@ -172,6 +183,7 @@ def validate_config(config: dict[str, Any]) -> None:
     if config.get("rtc_base", "utc") not in ("utc", "localtime"):
         raise ConfigError("rtc_base must be utc or localtime")
     normalize_display_resolution(config.get("display_resolution", "800x600"))
+    normalize_display_refresh_hz(config.get("display_refresh_hz", 60))
 
 
 def normalize_display_resolution(value: Any) -> str:
@@ -193,6 +205,17 @@ def normalize_display_resolution(value: Any) -> str:
     if width * height * 4 > MAX_DISPLAY_FRAMEBUFFER_BYTES:
         raise ConfigError("display framebuffer must not exceed 128 MiB")
     return f"{width}x{height}"
+
+
+def normalize_display_refresh_hz(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("display_refresh_hz must be an integer")
+    if not MIN_DISPLAY_REFRESH_HZ <= value <= MAX_DISPLAY_REFRESH_HZ:
+        raise ConfigError(
+            f"display refresh must be between {MIN_DISPLAY_REFRESH_HZ} and "
+            f"{MAX_DISPLAY_REFRESH_HZ} Hz"
+        )
+    return value
 
 
 def effective_gpu(config: dict[str, Any]) -> str:

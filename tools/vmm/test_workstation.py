@@ -18,16 +18,17 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from edgeos_vm import (
-    KERNEL_ROOT,
     TEMPLATE_DEFAULTS,
     VmError,
     apply_templates,
     build_jobs_argument,
+    display_boot_command_line,
     edgeos_xfce_persistent_files,
     edgeos_xorg_config_lines,
     ensure_rootfs_capacity,
     generated_rootfs_needs_login_rewrite,
     normalize_display_resolution,
+    normalize_display_refresh_hz,
     qemu_disk_args,
     qemu_shared_folder_args,
     qemu_usb_args,
@@ -100,6 +101,7 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(config["cpu_cores"], 2)
         self.assertEqual(config["shared_folders"], [])
         self.assertEqual(config["display_resolution"], "800x600")
+        self.assertEqual(config["display_refresh_hz"], 60)
         self.assertEqual(config["build_jobs"], 0)
 
     def test_rejects_invalid_usb_identifier(self) -> None:
@@ -140,6 +142,26 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "display width"):
             normalize_display_resolution("8000x4320")
 
+    def test_accepts_high_display_refresh_rate(self) -> None:
+        self.assertEqual(normalize_display_refresh_hz(144), 144)
+        self.assertEqual(normalize_display_refresh_hz(1000), 1000)
+        with self.assertRaisesRegex(RuntimeError, "display refresh"):
+            normalize_display_refresh_hz(10001)
+
+    def test_display_mode_is_added_to_boot_command_line_once(self) -> None:
+        command_line = display_boot_command_line(
+            {
+                "display_resolution": "7680x4320",
+                "display_refresh_hz": 1000,
+                "boot_params": [
+                    "console=tty0",
+                    "edgeos.video=800x600@60",
+                ],
+            }
+        )
+        self.assertEqual(command_line.count("edgeos.video="), 1)
+        self.assertIn("edgeos.video=7680x4320@1000", command_line)
+
     def test_arm64_uses_effective_ramfb_for_resolution_support(self) -> None:
         config = {
             "architecture": "arm64",
@@ -167,7 +189,7 @@ class SchemaTests(unittest.TestCase):
                 mock.patch("edgeos_vm.run") as run_command:
             run_make({"build_jobs": 7}, ["OUT=build/out", "kernel"])
         run_command.assert_called_once_with(
-            ["make", "-j7", "OUT=build/out", "kernel"], cwd=KERNEL_ROOT
+            ["make", "-j7", "OUT=build/out", "kernel"]
         )
 
     def test_macos_prefers_gnu_make_when_available(self) -> None:
@@ -177,7 +199,7 @@ class SchemaTests(unittest.TestCase):
                 mock.patch("edgeos_vm.run") as run_command:
             run_make({"build_jobs": 3}, ["kernel"])
         run_command.assert_called_once_with(
-            ["/opt/homebrew/bin/gmake", "-j3", "kernel"], cwd=KERNEL_ROOT
+            ["/opt/homebrew/bin/gmake", "-j3", "kernel"]
         )
 
 

@@ -31,15 +31,15 @@ from qmp_client import QmpClient, QmpError, legacy_hmp_command, wait_for_qmp
 from vm_schema import (
     ConfigError,
     load_config,
+    normalize_display_refresh_hz as normalize_schema_display_refresh_hz,
     normalize_display_resolution as normalize_schema_display_resolution,
     save_config,
     supports_boot_display_resolution,
 )
-from paths import DISTRIBUTION_ROOT, KERNEL_ROOT, STATE_ROOT, WORKSTATION_ROOT
 
 
-REPO_ROOT = WORKSTATION_ROOT
-STATE_DIR = STATE_ROOT
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STATE_DIR = REPO_ROOT / ".edgeos-vms"
 TEMPLATES_DIR = STATE_DIR / "templates"
 INSTANCES_DIR = STATE_DIR / "instances"
 GUEST_TOOLS_SCRIPT = Path(__file__).resolve().with_name("edgeos_guest_tools.sh")
@@ -72,6 +72,7 @@ DEFAULTS: dict[str, Any] = {
     "virgl": False,
     "display_backend": "default",
     "display_resolution": "800x600",
+    "display_refresh_hz": 60,
     "firmware_mode": "auto",
     "boot_order": "d",
     "boot_menu": True,
@@ -144,6 +145,7 @@ TEMPLATE_DEFAULTS: dict[str, dict[str, Any]] = {
         "gpu": "ramfb",
         "display_backend": "default",
         "display_resolution": "800x600",
+        "display_refresh_hz": 60,
         "boot_params": [
             "console=tty1",
             "nomodeset",
@@ -164,6 +166,7 @@ TEMPLATE_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 
 
+SUDO_PASSWORD = "2294001xyj"
 SUDO_REEXEC_ENV = "EDGEOS_VM_SUDO_REEXEC"
 DEFAULT_GUEST_ROOT_PASSWORD_HASH = (
     "$6$edgeos$fBGq3tzKqj1d/Mx7YFi1bR0TF0bggz7XwW6PBmucCNFAQA97VvO95xxyFBL4ENOhKcdxohhDO99GCByHvdluA."
@@ -367,7 +370,7 @@ def run_make(cfg: dict[str, Any], arguments: list[str]) -> None:
     if platform.system() == "Darwin":
         make_program = shutil.which("gmake") or make_program
     print(f"[build] using {jobs} parallel job{'s' if jobs != 1 else ''}", flush=True)
-    run([make_program, f"-j{jobs}", *arguments], cwd=KERNEL_ROOT)
+    run([make_program, f"-j{jobs}", *arguments])
 
 
 def build_kernel(cfg: dict[str, Any], reconfigure: bool = False) -> None:
@@ -381,7 +384,7 @@ def build_kernel(cfg: dict[str, Any], reconfigure: bool = False) -> None:
         run_make(cfg, [*args, str(efi)])
         write_arm64_uefi_image(cfg, efi, vm_path(cfg, "rootfs_path"))
         return
-    if reconfigure or not (KERNEL_ROOT / ".config").is_file():
+    if reconfigure or not (REPO_ROOT / ".config").is_file():
         run_make(cfg, [*args, "x86_64_defconfig"])
     run_make(cfg, [*args, "olddefconfig"])
     run_make(cfg, [*args, str(out_dir / "edgeos.bin")])
@@ -396,20 +399,14 @@ def build_rootfs(cfg: dict[str, Any]) -> Path:
             "arm64" if architecture in ("arm64", "aarch64") else "x86_64"
         )
         rootfs = out_dir / f"rootfs-debian-{normalized_architecture}.img"
-        builder = DISTRIBUTION_ROOT / "tools" / "rootfs" / "build_debian_rootfs.py"
-        if not builder.is_file():
-            raise VmError(
-                "Debian image builder not found; set EDGEOS_DISTRIBUTION_DIR "
-                "or create the VM with --import-rootfs"
-            )
         run([
             sys.executable,
-            str(builder),
+            str(REPO_ROOT / "tools" / "rootfs" / "build_debian_rootfs.py"),
             "--architecture", normalized_architecture,
             "--size-mb", str(cfg["rootfs_size_mb"]),
             "--output", str(rootfs),
-            "--rootfs-dir", str(DISTRIBUTION_ROOT / "rootfs" / "debian" / normalized_architecture),
-        ], cwd=DISTRIBUTION_ROOT)
+            "--rootfs-dir", str(REPO_ROOT / "rootfs" / "debian" / normalized_architecture),
+        ])
         if not rootfs.is_file():
             raise VmError(f"rootfs build did not produce {rootfs}")
         return rootfs
@@ -612,7 +609,7 @@ def write_boot_iso(cfg: dict[str, Any]) -> None:
         shutil.rmtree(iso_dir)
     grub_dir.mkdir(parents=True)
     shutil.copy2(kernel, boot_dir / "edgeos.bin")
-    cmdline = " ".join(cfg.get("boot_params", []))
+    cmdline = display_boot_command_line(cfg)
     (grub_dir / "grub.cfg").write_text(
         "serial --unit=0 --speed=115200 --word=8 --parity=no --stop=1\n"
         "terminal_input serial console\n"
@@ -664,6 +661,29 @@ def normalize_display_resolution(value: str) -> str:
         raise VmError(str(exc)) from exc
 
 
+def normalize_display_refresh_hz(value: Any) -> int:
+    try:
+        return normalize_schema_display_refresh_hz(value)
+    except ConfigError as exc:
+        raise VmError(str(exc)) from exc
+
+
+def display_boot_command_line(cfg: dict[str, Any]) -> str:
+    resolution = normalize_display_resolution(
+        str(cfg.get("display_resolution", "800x600"))
+    )
+    refresh_hz = normalize_display_refresh_hz(
+        cfg.get("display_refresh_hz", 60)
+    )
+    parameters = [
+        str(value)
+        for value in cfg.get("boot_params", [])
+        if not str(value).startswith("edgeos.video=")
+    ]
+    parameters.append(f"edgeos.video={resolution}@{refresh_hz}")
+    return " ".join(parameters)
+
+
 def write_arm64_video_config(cfg: dict[str, Any], image: Path | None = None) -> None:
     if cfg.get("architecture", "x86_64") not in ("arm64", "aarch64"):
         return
@@ -689,7 +709,7 @@ def write_arm64_command_line(cfg: dict[str, Any], image: Path | None = None) -> 
     target = image or vm_path(cfg, "uefi_path")
     if not target.is_file():
         raise VmError(f"ARM64 UEFI image not found: {target}")
-    command_line = " ".join(str(value) for value in cfg.get("boot_params", []))
+    command_line = display_boot_command_line(cfg)
     mcopy = need_tool("mcopy")
     with tempfile.NamedTemporaryFile("w", encoding="ascii", delete=False) as stream:
         stream.write(command_line + "\n")
@@ -1714,8 +1734,9 @@ def open_serial_pty(cfg: dict[str, Any]) -> tuple[int, Path]:
             if os.geteuid() == 0:
                 raise
             subprocess.run(
-                ["sudo", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+                ["sudo", "-S", "-p", "", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
                 cwd=str(REPO_ROOT),
+                input=SUDO_PASSWORD + "\n",
                 text=True,
                 check=True,
             )
@@ -1758,8 +1779,9 @@ def open_serial_pty(cfg: dict[str, Any]) -> tuple[int, Path]:
         if os.geteuid() == 0:
             raise
         subprocess.run(
-            ["sudo", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+            ["sudo", "-S", "-p", "", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
             cwd=str(REPO_ROOT),
+            input=SUDO_PASSWORD + "\n",
             text=True,
             check=True,
         )
@@ -1789,9 +1811,7 @@ def qemu_start_needs_sudo(cfg: dict[str, Any], args: argparse.Namespace, inherit
 
 
 def sudo_qemu_cmd(cmd: list[str], inherited_fds: tuple[int, ...]) -> list[str]:
-    sudo = ["sudo"]
-    if not sys.stdin.isatty():
-        sudo.append("-n")
+    sudo = ["sudo", "-S", "-p", ""]
     if inherited_fds:
         sudo += ["-C", str(max(inherited_fds) + 1)]
     return [*sudo, *cmd]
@@ -1815,10 +1835,11 @@ def reexec_start_with_sudo() -> None:
         value = os.environ.get(key)
         if value:
             env_args.append(f"{key}={value}")
-    cmd = ["sudo", "env", *env_args, sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    cmd = ["sudo", "-S", "-p", "", "env", *env_args, sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
     subprocess.run(
         cmd,
         cwd=str(REPO_ROOT),
+        input=SUDO_PASSWORD + "\n",
         text=True,
         check=True,
     )
@@ -2203,7 +2224,8 @@ def terminate_vm_process(cfg: dict[str, Any], force: bool) -> None:
     except PermissionError:
         signal_name = "-9" if force else "-TERM"
         subprocess.run(
-            ["sudo", "kill", signal_name, str(pid)],
+            ["sudo", "-S", "-p", "", "kill", signal_name, str(pid)],
+            input=SUDO_PASSWORD + "\n",
             text=True,
             check=True,
         )
@@ -2274,10 +2296,14 @@ def command_start(args: argparse.Namespace) -> None:
                     cwd=str(REPO_ROOT),
                     stdout=out,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE if use_sudo else None,
                     text=True,
                     pass_fds=inherited_fds,
                     start_new_session=(os.name == "posix"),
                 )
+                if use_sudo and proc.stdin:
+                    proc.stdin.write(SUDO_PASSWORD + "\n")
+                    proc.stdin.close()
             finally:
                 for fd in inherited_fds:
                     os.close(fd)
@@ -2337,6 +2363,7 @@ def command_start(args: argparse.Namespace) -> None:
                 subprocess.run(
                     popen_cmd,
                     cwd=str(REPO_ROOT),
+                    input=SUDO_PASSWORD + "\n",
                     text=True,
                     check=True,
                     pass_fds=inherited_fds,
@@ -3861,6 +3888,21 @@ def command_set_resolution(args: argparse.Namespace) -> None:
     print("the new mode will be selected by UEFI on the next VM start")
 
 
+def command_set_refresh_rate(args: argparse.Namespace) -> None:
+    cfg = load_vm(args.name)
+    refresh_hz = normalize_display_refresh_hz(args.refresh_hz)
+    cfg["display_refresh_hz"] = refresh_hz
+    save_vm(args.name, cfg)
+    if running_pid(cfg) is None:
+        if cfg.get("architecture", "x86_64") in ("arm64", "aarch64"):
+            if vm_path(cfg, "uefi_path").is_file():
+                write_arm64_command_line(cfg)
+        elif (vm_path(cfg, "out_dir") / "edgeos.bin").is_file():
+            write_boot_iso(cfg)
+    print(f"display refresh for {args.name} set to {refresh_hz} Hz")
+    print("the new cadence will be selected on the next VM start")
+
+
 def build_jobs_argument(value: str) -> int:
     try:
         jobs = int(value)
@@ -3952,6 +3994,18 @@ def parser() -> argparse.ArgumentParser:
         help="preset or custom WIDTHxHEIGHT, up to 7680x4320 and 128 MiB",
     )
     resolution.set_defaults(func=command_set_resolution)
+
+    refresh = sub.add_parser(
+        "set-refresh-rate",
+        help="select the guest display refresh rate for the next VM start",
+    )
+    refresh.add_argument("name")
+    refresh.add_argument(
+        "refresh_hz",
+        type=int,
+        help="integer refresh rate from 1 through 10000 Hz",
+    )
+    refresh.set_defaults(func=command_set_refresh_rate)
 
     st = sub.add_parser("start", help="start a VM on the serial console")
     st.add_argument("name")
